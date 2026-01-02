@@ -6,6 +6,7 @@ import contextlib
 import io
 import itertools
 import json
+import os
 import tempfile
 import time
 from collections import ChainMap, defaultdict
@@ -14,6 +15,10 @@ from tabulate import tabulate
 from tqdm import tqdm
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 import torch
 
@@ -112,6 +117,7 @@ class COCOEvaluator:
         self.testdev = testdev
         self.per_class_AP = per_class_AP
         self.per_class_AR = per_class_AR
+        self.output_dir = None  # Will be set by trainer if needed
 
     def evaluate(
         self, model, distributed=False, half=False, trt_file=None,
@@ -199,6 +205,13 @@ class COCOEvaluator:
 
         eval_results = self.evaluate_prediction(data_list, statistics)
         synchronize()
+        
+        # Generate confusion matrix if in main process
+        if is_main_process() and self.output_dir is not None:
+            try:
+                self.generate_confusion_matrix(data_list)
+            except Exception as e:
+                logger.warning(f"Failed to generate confusion matrix: {e}")
 
         if return_outputs:
             return eval_results, output_data
@@ -282,6 +295,12 @@ class COCOEvaluator:
         # Evaluate the Dt (detection) json comparing with the ground truth
         if len(data_dict) > 0:
             cocoGt = self.dataloader.dataset.coco
+            # Ensure required fields exist for pycocotools (they may have been removed by remove_useless_info)
+            if 'info' not in cocoGt.dataset:
+                cocoGt.dataset['info'] = {}
+            if 'licenses' not in cocoGt.dataset:
+                cocoGt.dataset['licenses'] = []
+            
             # TODO: since pycocotools can't process dict in py36, write data to json file.
             if self.testdev:
                 json.dump(data_dict, open("./yolox_testdev_2017.json", "w"))
@@ -292,12 +311,20 @@ class COCOEvaluator:
                 cocoDt = cocoGt.loadRes(tmp)
             try:
                 from yolox.layers import COCOeval_opt as COCOeval
+                # Try to instantiate to check if C++ compilation works
+                # If it fails, fall back to standard COCOeval
+                try:
+                    cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+                except Exception:
+                    # C++ compilation failed (e.g., Windows without compiler)
+                    from pycocotools.cocoeval import COCOeval
+                    cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+                    logger.warning("Fast COCOeval compilation failed, using standard COCOeval.")
             except ImportError:
+                # Fast COCOeval not available at all
                 from pycocotools.cocoeval import COCOeval
-
-                logger.warning("Use standard COCOeval.")
-
-            cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+                cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+                logger.warning("Fast COCOeval not available, using standard COCOeval.")
             cocoEval.evaluate()
             cocoEval.accumulate()
             redirect_string = io.StringIO()
@@ -315,3 +342,191 @@ class COCOEvaluator:
             return cocoEval.stats[0], cocoEval.stats[1], info
         else:
             return 0, 0, info
+    
+    def generate_confusion_matrix(self, predictions):
+        """
+        Generate and save confusion matrix from predictions and ground truth.
+        
+        Args:
+            predictions: List of prediction dictionaries in COCO format
+        """
+        try:
+            from pycocotools.coco import COCO
+            
+            cocoGt = self.dataloader.dataset.coco
+            cat_ids = sorted(cocoGt.cats.keys())
+            cat_names = [cocoGt.cats[catId]['name'] for catId in cat_ids]
+            
+            # Create mapping from COCO category IDs to class indices
+            cat_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(cat_ids)}
+            
+            # Initialize confusion matrix (add 1 for background/false positives)
+            num_classes = len(cat_ids)
+            confusion_matrix = np.zeros((num_classes + 1, num_classes + 1), dtype=np.int32)
+            
+            # Group predictions by image_id
+            pred_by_image = defaultdict(list)
+            for pred in predictions:
+                pred_by_image[pred['image_id']].append(pred)
+            
+            # For each image, match predictions to ground truth
+            for img_id, preds in pred_by_image.items():
+                # Get ground truth annotations for this image
+                ann_ids = cocoGt.getAnnIds(imgIds=[img_id])
+                anns = cocoGt.loadAnns(ann_ids)
+                
+                # Convert predictions to numpy arrays
+                pred_boxes = []
+                pred_classes = []
+                pred_scores = []
+                for pred in preds:
+                    bbox = pred['bbox']  # [x, y, w, h]
+                    # Convert to [x1, y1, x2, y2]
+                    x1, y1, w, h = bbox
+                    x2 = x1 + w
+                    y2 = y1 + h
+                    pred_boxes.append([x1, y1, x2, y2])
+                    pred_classes.append(cat_id_to_idx.get(pred['category_id'], -1))
+                    pred_scores.append(pred['score'])
+                
+                if len(pred_boxes) == 0:
+                    # No predictions - all ground truth are false negatives
+                    for ann in anns:
+                        gt_class = cat_id_to_idx.get(ann['category_id'], -1)
+                        if gt_class >= 0:
+                            confusion_matrix[gt_class, num_classes] += 1  # FN
+                    continue
+                
+                pred_boxes = np.array(pred_boxes)
+                pred_classes = np.array(pred_classes)
+                pred_scores = np.array(pred_scores)
+                
+                # Convert ground truth to numpy arrays
+                gt_boxes = []
+                gt_classes = []
+                for ann in anns:
+                    bbox = ann['bbox']  # [x, y, w, h]
+                    x1, y1, w, h = bbox
+                    x2 = x1 + w
+                    y2 = y1 + h
+                    gt_boxes.append([x1, y1, x2, y2])
+                    gt_class = cat_id_to_idx.get(ann['category_id'], -1)
+                    gt_classes.append(gt_class)
+                
+                if len(gt_boxes) == 0:
+                    # No ground truth - all predictions are false positives
+                    for pred_cls in pred_classes:
+                        if pred_cls >= 0:
+                            confusion_matrix[num_classes, pred_cls] += 1  # FP
+                    continue
+                
+                gt_boxes = np.array(gt_boxes)
+                gt_classes = np.array(gt_classes)
+                
+                # Compute IoU matrix
+                ious = self._compute_iou_matrix(pred_boxes, gt_boxes)
+                
+                # Match predictions to ground truth using IoU threshold of 0.5
+                iou_threshold = 0.5
+                matched_gt = set()
+                matched_pred = set()
+                
+                # Sort by IoU (highest first)
+                matches = []
+                for i in range(len(pred_boxes)):
+                    for j in range(len(gt_boxes)):
+                        if ious[i, j] >= iou_threshold:
+                            matches.append((ious[i, j], i, j))
+                
+                matches.sort(reverse=True)
+                
+                for iou, pred_idx, gt_idx in matches:
+                    if pred_idx not in matched_pred and gt_idx not in matched_gt:
+                        pred_cls = pred_classes[pred_idx]
+                        gt_cls = gt_classes[gt_idx]
+                        if pred_cls >= 0 and gt_cls >= 0:
+                            confusion_matrix[gt_cls, pred_cls] += 1  # TP or misclassification
+                        matched_pred.add(pred_idx)
+                        matched_gt.add(gt_idx)
+                
+                # Unmatched predictions are false positives
+                for pred_idx in range(len(pred_boxes)):
+                    if pred_idx not in matched_pred:
+                        pred_cls = pred_classes[pred_idx]
+                        if pred_cls >= 0:
+                            confusion_matrix[num_classes, pred_cls] += 1  # FP
+                
+                # Unmatched ground truth are false negatives
+                for gt_idx in range(len(gt_boxes)):
+                    if gt_idx not in matched_gt:
+                        gt_cls = gt_classes[gt_idx]
+                        if gt_cls >= 0:
+                            confusion_matrix[gt_cls, num_classes] += 1  # FN
+            
+            # Plot confusion matrix
+            self._plot_confusion_matrix(confusion_matrix, cat_names, num_classes)
+            
+        except Exception as e:
+            logger.warning(f"Error generating confusion matrix: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+    
+    def _compute_iou_matrix(self, boxes1, boxes2):
+        """Compute IoU matrix between two sets of boxes."""
+        # boxes: [N, 4] in format [x1, y1, x2, y2]
+        def box_area(boxes):
+            return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        
+        area1 = box_area(boxes1)
+        area2 = box_area(boxes2)
+        
+        lt = np.maximum(boxes1[:, None, :2], boxes2[:, :2])  # [N, M, 2]
+        rb = np.minimum(boxes1[:, None, 2:], boxes2[:, 2:])  # [N, M, 2]
+        
+        inter = np.prod(np.clip(rb - lt, 0, None), axis=2)  # [N, M]
+        union = area1[:, None] + area2 - inter
+        
+        iou = inter / (union + 1e-6)
+        return iou
+    
+    def _plot_confusion_matrix(self, confusion_matrix, class_names, num_classes):
+        """Plot and save confusion matrix."""
+        # Add "Background" to class names for the last row/column
+        display_names = class_names + ['Background']
+        
+        # Normalize confusion matrix for better visualization
+        cm_normalized = confusion_matrix.astype('float') / (confusion_matrix.sum(axis=1)[:, np.newaxis] + 1e-6)
+        
+        # Create figure
+        plt.figure(figsize=(max(10, num_classes), max(10, num_classes)))
+        
+        # Plot using seaborn for better visualization
+        sns.heatmap(
+            cm_normalized,
+            annot=True,
+            fmt='.2f',
+            cmap='Blues',
+            xticklabels=display_names,
+            yticklabels=display_names,
+            cbar_kws={'label': 'Normalized Count'},
+            square=True,
+            linewidths=0.5
+        )
+        
+        plt.title('Confusion Matrix', fontsize=16, fontweight='bold', pad=20)
+        plt.ylabel('True Label', fontsize=12)
+        plt.xlabel('Predicted Label', fontsize=12)
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        
+        # Save figure
+        if self.output_dir and os.path.exists(self.output_dir):
+            cm_path = os.path.join(self.output_dir, "confusion_matrix.png")
+            plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            logger.info(f"Confusion matrix saved to {cm_path}")
+        else:
+            plt.close()
+            if self.output_dir:
+                logger.warning(f"Output directory does not exist: {self.output_dir}")

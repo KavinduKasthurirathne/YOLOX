@@ -127,6 +127,10 @@ if __name__ == "__main__":
 
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
+    
+    # Use exp.logger if it exists (user can still override via command line)
+    if hasattr(exp, 'logger') and exp.logger:
+        args.logger = exp.logger
 
     num_gpu = get_num_devices() if args.devices is None else args.devices
     assert num_gpu <= get_num_devices()

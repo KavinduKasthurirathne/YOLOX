@@ -4,11 +4,17 @@
 import datetime
 import os
 import time
+import csv
+import json
 from loguru import logger
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import numpy as np
 
 from yolox.data import DataPrefetcher
 from yolox.exp import Exp
@@ -60,6 +66,20 @@ class Trainer:
         # metric record
         self.meter = MeterBuffer(window_size=exp.print_interval)
         self.file_name = os.path.join(exp.output_dir, args.experiment_name)
+
+        # Track training statistics across epochs
+        self.training_stats = {
+            'epoch': [],
+            'loss': [],
+            'iou_loss': [],
+            'l1_loss': [],
+            'conf_loss': [],
+            'cls_loss': [],
+            'total_loss': [],
+            'mAP_50_95': [],
+            'mAP_50': [],
+            'lr': []
+        }
 
         if self.rank == 0:
             os.makedirs(self.file_name, exist_ok=True)
@@ -177,6 +197,9 @@ class Trainer:
         self.evaluator = self.exp.get_evaluator(
             batch_size=self.args.batch_size, is_distributed=self.is_distributed
         )
+        # Set output directory for evaluator to save confusion matrix
+        if hasattr(self.evaluator, 'output_dir'):
+            self.evaluator.output_dir = self.file_name
         # Tensorboard and Wandb loggers
         if self.rank == 0:
             if self.args.logger == "tensorboard":
@@ -213,6 +236,9 @@ class Trainer:
                 }
                 self.mlflow_logger.on_train_end(self.args, file_name=self.file_name,
                                                 metadata=metadata)
+            
+            # Save training statistics as CSV and PNG
+            self.save_training_statistics()
 
     def before_epoch(self):
         logger.info("---> start train epoch{}".format(self.epoch + 1))
@@ -230,6 +256,25 @@ class Trainer:
                 self.save_ckpt(ckpt_name="last_mosaic_epoch")
 
     def after_epoch(self):
+        # Record epoch-level training loss
+        if self.rank == 0:
+            loss_meter = self.meter.get_filtered_meter("loss")
+            epoch_losses = {k: v.global_avg for k, v in loss_meter.items()}
+            
+            # Helper function to convert tensor to Python float using .item()
+            def to_float(value):
+                if isinstance(value, torch.Tensor):
+                    return value.detach().cpu().item()
+                return float(value) if value is not None else 0.0
+            
+            self.training_stats['epoch'].append(self.epoch + 1)
+            self.training_stats['total_loss'].append(to_float(epoch_losses.get('total_loss', 0.0)))
+            self.training_stats['iou_loss'].append(to_float(epoch_losses.get('iou_loss', 0.0)))
+            self.training_stats['l1_loss'].append(to_float(epoch_losses.get('l1_loss', 0.0)))
+            self.training_stats['conf_loss'].append(to_float(epoch_losses.get('conf_loss', 0.0)))
+            self.training_stats['cls_loss'].append(to_float(epoch_losses.get('cls_loss', 0.0)))
+            self.training_stats['lr'].append(to_float(self.meter['lr'].global_avg if 'lr' in self.meter else 0.0))
+        
         self.save_ckpt(ckpt_name="latest")
 
         if (self.epoch + 1) % self.exp.eval_interval == 0:
@@ -351,6 +396,9 @@ class Trainer:
             if is_parallel(evalmodel):
                 evalmodel = evalmodel.module
 
+        # Set current epoch in exp for eval hook
+        self.exp._current_epoch = self.epoch + 1
+
         with adjust_status(evalmodel, training=False):
             (ap50_95, ap50, summary), predictions = self.exp.eval(
                 evalmodel, self.evaluator, self.is_distributed, return_outputs=True
@@ -395,6 +443,23 @@ class Trainer:
                 }
             self.mlflow_logger.save_checkpoints(self.args, self.exp, self.file_name, self.epoch,
                                                 metadata, update_best_ckpt)
+        
+        # Record validation metrics (only when evaluation happens)
+        if self.rank == 0:
+            # Helper function to convert tensor to Python float using .item()
+            def to_float(value):
+                if isinstance(value, torch.Tensor):
+                    return value.detach().cpu().item()
+                return float(value) if value is not None else None
+            
+            # Pad mAP lists to match epoch count (excluding current epoch)
+            current_epoch_idx = len(self.training_stats['epoch']) - 1
+            while len(self.training_stats['mAP_50_95']) < current_epoch_idx:
+                self.training_stats['mAP_50_95'].append(None)
+                self.training_stats['mAP_50'].append(None)
+            # Append current mAP values as Python floats
+            self.training_stats['mAP_50_95'].append(to_float(ap50_95))
+            self.training_stats['mAP_50'].append(to_float(ap50))
 
     def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None):
         if self.rank == 0:
@@ -426,3 +491,174 @@ class Trainer:
                         "curr_ap": ap
                     }
                 )
+    
+    def save_training_statistics(self):
+        """Save training statistics as CSV and generate visualization plots."""
+        if not self.training_stats['epoch']:
+            logger.warning("No training statistics to save.")
+            return
+        
+        # Helper function to convert tensor to Python scalar for CSV
+        def to_scalar(value):
+            if isinstance(value, torch.Tensor):
+                cpu_tensor = value.detach().cpu()
+                if cpu_tensor.numel() == 1:
+                    return cpu_tensor.item()
+                else:
+                    return float(cpu_tensor.numpy())
+            return value
+        
+        # Save as CSV
+        csv_path = os.path.join(self.file_name, "training_stats.csv")
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow(self.training_stats.keys())
+            # Write data rows
+            max_len = max(len(v) for v in self.training_stats.values())
+            for i in range(max_len):
+                row = []
+                for key in self.training_stats.keys():
+                    if i < len(self.training_stats[key]):
+                        value = self.training_stats[key][i]
+                        row.append(to_scalar(value))
+                    else:
+                        row.append('')
+                writer.writerow(row)
+        logger.info(f"Training statistics saved to {csv_path}")
+        
+        # Generate visualization plots
+        self.plot_training_statistics()
+    
+    def _convert_to_numpy(self, value):
+        """Recursively convert tensor values to numpy arrays or Python scalars for plotting."""
+        if isinstance(value, torch.Tensor):
+            # Convert tensor to CPU and then to numpy or scalar
+            cpu_tensor = value.detach().cpu()
+            if cpu_tensor.numel() == 1:
+                return cpu_tensor.item()
+            else:
+                return cpu_tensor.numpy()
+        elif isinstance(value, list):
+            return [self._convert_to_numpy(v) for v in value]
+        elif isinstance(value, tuple):
+            return tuple(self._convert_to_numpy(v) for v in value)
+        else:
+            return value
+    
+    def plot_training_statistics(self):
+        """Generate PNG plots for training statistics."""
+        epochs = self.training_stats['epoch']
+        if not epochs:
+            return
+        
+        # Convert all tensor values to numpy arrays/Python scalars
+        total_loss = self._convert_to_numpy(self.training_stats['total_loss'])
+        iou_loss = self._convert_to_numpy(self.training_stats['iou_loss'])
+        l1_loss = self._convert_to_numpy(self.training_stats['l1_loss'])
+        conf_loss = self._convert_to_numpy(self.training_stats['conf_loss'])
+        cls_loss = self._convert_to_numpy(self.training_stats['cls_loss'])
+        lr = self._convert_to_numpy(self.training_stats['lr'])
+        mAP_50_95 = self._convert_to_numpy(self.training_stats['mAP_50_95'])
+        mAP_50 = self._convert_to_numpy(self.training_stats['mAP_50'])
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('Training Statistics', fontsize=16, fontweight='bold')
+        
+        # Plot 1: Loss curves
+        ax1 = axes[0, 0]
+        if total_loss:
+            ax1.plot(epochs[:len(total_loss)], 
+                    total_loss, 'b-', label='Total Loss', linewidth=2)
+        if iou_loss:
+            ax1.plot(epochs[:len(iou_loss)], 
+                    iou_loss, 'r--', label='IoU Loss', linewidth=1.5)
+        if l1_loss:
+            ax1.plot(epochs[:len(l1_loss)], 
+                    l1_loss, 'g--', label='L1 Loss', linewidth=1.5)
+        if conf_loss:
+            ax1.plot(epochs[:len(conf_loss)], 
+                    conf_loss, 'm--', label='Conf Loss', linewidth=1.5)
+        if cls_loss:
+            ax1.plot(epochs[:len(cls_loss)], 
+                    cls_loss, 'c--', label='Cls Loss', linewidth=1.5)
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.set_title('Loss Curves', fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: mAP curves
+        ax2 = axes[0, 1]
+        if mAP_50_95:
+            # Filter out None values
+            valid_mAP_50_95 = [(e, v) for e, v in zip(epochs, mAP_50_95) if v is not None]
+            if valid_mAP_50_95:
+                eval_epochs, mAP_values = zip(*valid_mAP_50_95)
+                ax2.plot(eval_epochs, mAP_values, 
+                        'b-o', label='mAP@0.5:0.95', linewidth=2, markersize=6)
+        if mAP_50:
+            # Filter out None values
+            valid_mAP_50 = [(e, v) for e, v in zip(epochs, mAP_50) if v is not None]
+            if valid_mAP_50:
+                eval_epochs, mAP_values = zip(*valid_mAP_50)
+                ax2.plot(eval_epochs, mAP_values, 
+                        'r-s', label='mAP@0.5', linewidth=2, markersize=6)
+        ax2.set_xlabel('Epoch', fontsize=12)
+        ax2.set_ylabel('mAP', fontsize=12)
+        ax2.set_title('mAP Curves', fontsize=14, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot 3: Learning rate
+        ax3 = axes[1, 0]
+        if lr:
+            ax3.plot(epochs[:len(lr)], 
+                    lr, 'g-', linewidth=2)
+        ax3.set_xlabel('Epoch', fontsize=12)
+        ax3.set_ylabel('Learning Rate', fontsize=12)
+        ax3.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_yscale('log')
+        
+        # Plot 4: Combined Loss and mAP
+        ax4 = axes[1, 1]
+        ax4_twin = ax4.twinx()
+        
+        if total_loss:
+            line1 = ax4.plot(epochs[:len(total_loss)], 
+                           total_loss, 'b-', label='Total Loss', linewidth=2)
+            ax4.set_ylabel('Loss', fontsize=12, color='b')
+            ax4.tick_params(axis='y', labelcolor='b')
+        
+        if mAP_50_95:
+            # Filter out None values
+            valid_mAP_50_95 = [(e, v) for e, v in zip(epochs, mAP_50_95) if v is not None]
+            if valid_mAP_50_95:
+                eval_epochs, mAP_values = zip(*valid_mAP_50_95)
+                line2 = ax4_twin.plot(eval_epochs, mAP_values, 
+                                    'r-o', label='mAP@0.5:0.95', linewidth=2, markersize=6)
+            ax4_twin.set_ylabel('mAP', fontsize=12, color='r')
+            ax4_twin.tick_params(axis='y', labelcolor='r')
+        
+        ax4.set_xlabel('Epoch', fontsize=12)
+        ax4.set_title('Loss vs mAP', fontsize=14, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        
+        # Combine legends
+        lines = []
+        labels = []
+        for ax in [ax4, ax4_twin]:
+            ax_lines, ax_labels = ax.get_legend_handles_labels()
+            lines.extend(ax_lines)
+            labels.extend(ax_labels)
+        ax4.legend(lines, labels, loc='upper left')
+        
+        plt.tight_layout()
+        
+        # Save figure
+        plot_path = os.path.join(self.file_name, "training_statistics.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Training statistics plots saved to {plot_path}")

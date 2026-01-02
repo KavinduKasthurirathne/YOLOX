@@ -53,21 +53,26 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agn
         if not detections.size(0):
             continue
 
+        # Move to CPU for NMS if CUDA is not available for torchvision ops
+        # This fixes the "NotImplementedError: Could not run 'torchvision::nms' with arguments from the 'CUDA' backend"
+        device = detections.device
+        detections_cpu = detections.cpu()
+        
         if class_agnostic:
             nms_out_index = torchvision.ops.nms(
-                detections[:, :4],
-                detections[:, 4] * detections[:, 5],
+                detections_cpu[:, :4],
+                detections_cpu[:, 4] * detections_cpu[:, 5],
                 nms_thre,
             )
         else:
             nms_out_index = torchvision.ops.batched_nms(
-                detections[:, :4],
-                detections[:, 4] * detections[:, 5],
-                detections[:, 6],
+                detections_cpu[:, :4],
+                detections_cpu[:, 4] * detections_cpu[:, 5],
+                detections_cpu[:, 6],
                 nms_thre,
             )
 
-        detections = detections[nms_out_index]
+        detections = detections_cpu[nms_out_index].to(device)
         if output[i] is None:
             output[i] = detections
         else:

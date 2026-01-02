@@ -129,7 +129,12 @@ class MeterBuffer(defaultdict):
         values.update(kwargs)
         for k, v in values.items():
             if isinstance(v, torch.Tensor):
+                # Detach, move to CPU and convert to a Python scalar if it's a single-element tensor
                 v = v.detach()
+                if v.numel() == 1:
+                    v = v.cpu().item()
+                else:
+                    v = v.cpu().numpy()
             self[k].update(v)
 
     def clear_meters(self):
